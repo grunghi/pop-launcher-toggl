@@ -371,7 +371,7 @@ class Plugin:
         if self._rate_limited:
             self.results = [("none", None)]
             send_append(0, "API rate limit reached",
-                        "Free plan limit — try again in a few minutes",
+                        "Try again in a few minutes",
                         ICON_WARNING)
             send_finished()
             return
