@@ -1,0 +1,7 @@
+# Toggl Track API configuration
+# Get your API token from: https://track.toggl.com/profile
+# Find your workspace ID in the URL at: https://track.toggl.com/reports
+
+api_token = ""
+workspace_id = 0
+keyword = "toggl"

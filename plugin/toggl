@@ -1,0 +1,522 @@
+#!/usr/bin/env python3
+"""Pop-launcher plugin for Toggl Track time tracking."""
+
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from base64 import b64encode
+from datetime import datetime, timezone
+from pathlib import Path
+
+PLUGIN_DIR = Path(__file__).parent
+CONFIG_PATH = PLUGIN_DIR / "config.toml"
+ICON_DIR = PLUGIN_DIR / "icons"
+TOGGL_URL = "https://track.toggl.com"
+API_BASE = "https://api.track.toggl.com/api/v9"
+
+# Icons (absolute paths to bundled SVGs)
+ICON_TIMER = str(ICON_DIR / "timer.svg")
+ICON_PLAY = str(ICON_DIR / "play.svg")
+ICON_STOP = str(ICON_DIR / "stop.svg")
+ICON_PLUS = str(ICON_DIR / "plus.svg")
+ICON_WARNING = str(ICON_DIR / "warning.svg")
+ICON_SETTINGS = str(ICON_DIR / "settings.svg")
+
+# Cache
+_cache = {"entries": None, "current": None, "projects": None, "ts": 0}
+CACHE_TTL = 120
+DEFAULT_KEYWORD = "toggl"
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+# -- Config ------------------------------------------------------------------
+
+def load_config():
+    """Parse config.toml manually (no external deps)."""
+    if not CONFIG_PATH.exists():
+        return None, None
+    token, wid = "", 0
+    for line in CONFIG_PATH.read_text().splitlines():
+        line = line.strip()
+        if line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key = key.strip()
+        # Strip inline comments, then surrounding whitespace and quotes
+        val = val.split("#")[0].strip().strip('"').strip("'")
+        if key == "api_token":
+            token = val
+        elif key == "workspace_id":
+            try:
+                wid = int(val)
+            except ValueError:
+                wid = 0
+    return token or None, wid or None
+
+
+def save_config(token, wid):
+    """Write config.toml with restricted permissions."""
+    CONFIG_PATH.write_text(
+        '# Toggl Track API configuration\n'
+        '# Get your API token from: https://track.toggl.com/profile\n\n'
+        f'api_token = "{token}"\n'
+        f'workspace_id = {wid}\n'
+    )
+    CONFIG_PATH.chmod(0o600)
+
+
+def run_new_timer(projects):
+    """Launch zenity dialogs to create a new timer. Returns (description, project_id) or None."""
+    try:
+        desc = subprocess.run(
+            ["zenity", "--entry",
+             "--title=New Toggl Timer",
+             "--text=Timer description:",
+             "--width=400"],
+            capture_output=True, text=True, timeout=120,
+        )
+        if desc.returncode != 0 or not desc.stdout.strip():
+            return None
+        description = desc.stdout.strip()
+
+        project_id = None
+        if projects:
+            # Build column data: ID, Name pairs
+            items = []
+            for pid, pname in sorted(projects.items(), key=lambda x: x[1].lower()):
+                items.extend([str(pid), pname])
+
+            proj = subprocess.run(
+                ["zenity", "--list",
+                 "--title=Select Project",
+                 "--text=Choose a project (or cancel for no project):",
+                 "--column=ID", "--column=Project",
+                 "--hide-column=1",
+                 "--width=400", "--height=400"] + items,
+                capture_output=True, text=True, timeout=120,
+            )
+            if proj.returncode == 0 and proj.stdout.strip():
+                try:
+                    project_id = int(proj.stdout.strip())
+                except ValueError:
+                    pass
+
+        return description, project_id
+    except FileNotFoundError:
+        log("zenity not found")
+        return None
+    except Exception as e:
+        log(f"New timer dialog error: {e}")
+        return None
+
+
+def run_setup():
+    """Launch zenity dialogs to configure the plugin. Returns (token, wid) or None."""
+    try:
+        token = subprocess.run(
+            ["zenity", "--entry",
+             "--title=Toggl Track Setup",
+             "--text=Enter your Toggl API token\n(find it at track.toggl.com/profile):",
+             "--width=400"],
+            capture_output=True, text=True, timeout=60,
+        )
+        if token.returncode != 0 or not token.stdout.strip():
+            return None
+        token = token.stdout.strip()
+
+        wid = subprocess.run(
+            ["zenity", "--entry",
+             "--title=Toggl Track Setup",
+             "--text=Enter your Workspace ID\n(visible in the URL at track.toggl.com/reports):",
+             "--width=400"],
+            capture_output=True, text=True, timeout=60,
+        )
+        if wid.returncode != 0 or not wid.stdout.strip():
+            return None
+        try:
+            wid = int(wid.stdout.strip())
+        except ValueError:
+            subprocess.run(
+                ["zenity", "--error", "--text=Workspace ID must be a number.", "--width=300"],
+                timeout=10,
+            )
+            return None
+
+        save_config(token, wid)
+        return token, wid
+    except FileNotFoundError:
+        log("zenity not found")
+        return None
+    except Exception as e:
+        log(f"Setup error: {e}")
+        return None
+
+
+# -- API helpers --------------------------------------------------------------
+
+def _auth_header(token):
+    cred = b64encode(f"{token}:api_token".encode()).decode()
+    return f"Basic {cred}"
+
+
+def api(method, path, token, body=None):
+    url = f"{API_BASE}{path}"
+    data = json.dumps(body).encode() if body else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Authorization", _auth_header(token))
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            raw = resp.read()
+            return json.loads(raw) if raw else None
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()
+        log(f"API {method} {path} -> {e.code}: {body}")
+        if e.code == 402 or e.code == 429:
+            return {"_error": "rate_limit"}
+        return None
+    except Exception as e:
+        log(f"API error: {e}")
+        return None
+
+
+def get_current(token):
+    return api("GET", "/me/time_entries/current", token)
+
+
+def get_recent(token):
+    entries = api("GET", "/me/time_entries", token)
+    return entries if isinstance(entries, list) else []
+
+
+def get_projects(token, wid):
+    projects = api("GET", "/me/projects", token)
+    if isinstance(projects, list):
+        return {p["id"]: p.get("name", "") for p in projects if p.get("workspace_id") == wid}
+    return {}
+
+
+def start_timer(token, wid, description, project_id=None, tags=None):
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    body = {
+        "description": description,
+        "start": now,
+        "duration": -1,
+        "workspace_id": wid,
+        "created_with": "pop-launcher-toggl",
+    }
+    if project_id:
+        body["project_id"] = project_id
+    if tags:
+        body["tags"] = tags
+    return api("POST", f"/workspaces/{wid}/time_entries", token, body)
+
+
+def stop_timer(token, wid, entry_id):
+    return api("PATCH", f"/workspaces/{wid}/time_entries/{entry_id}/stop", token)
+
+
+# -- Formatting ---------------------------------------------------------------
+
+def elapsed_str(start_iso):
+    try:
+        start = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
+        delta = datetime.now(timezone.utc) - start
+        secs = int(delta.total_seconds())
+        h, m = secs // 3600, (secs % 3600) // 60
+        return f"{h}h {m:02d}m" if h else f"{m}m"
+    except Exception:
+        return "?"
+
+
+def entry_description(entry):
+    return entry.get("description") or "(no description)"
+
+
+def project_name(entry, projects):
+    pid = entry.get("project_id")
+    if pid and pid in projects:
+        return projects[pid]
+    return None
+
+
+# -- IPC helpers ---------------------------------------------------------------
+
+def send(obj):
+    print(json.dumps(obj), flush=True)
+
+
+def send_append(id_, name, description="", icon=ICON_TIMER):
+    send({"Append": {
+        "id": id_,
+        "name": name,
+        "description": description,
+        "keywords": None,
+        "icon": {"Name": icon},
+        "exec": None,
+        "window": None,
+    }})
+
+
+def send_clear():
+    send({"Clear": None})
+
+
+def send_finished():
+    send({"Finished": None})
+
+
+def send_fill(text):
+    send({"Fill": text})
+
+
+def send_close():
+    send({"Close": None})
+
+
+def send_context(id_, options):
+    send({"Context": {"id": id_, "options": options}})
+
+
+# -- Plugin state --------------------------------------------------------------
+
+class Plugin:
+    def __init__(self):
+        self.token, self.wid = load_config()
+        self.current = None    # running timer entry
+        self.entries = []      # recent entries (deduped)
+        self.projects = {}     # id -> name
+        self.results = []      # id -> action mapping
+        self._rate_limited = False
+
+    def configured(self):
+        return self.token and self.wid
+
+    def stop_current(self):
+        """Stop the currently running timer, if any."""
+        if self.current:
+            eid = self.current.get("id")
+            wid = self.current.get("workspace_id") or self.wid
+            stop_timer(self.token, wid, eid)
+
+    def refresh(self, force=False):
+        now = time.monotonic()
+        if not force and _cache["ts"] and (now - _cache["ts"]) < CACHE_TTL:
+            self.current = _cache["current"]
+            self.entries = _cache["entries"]
+            self.projects = _cache["projects"]
+            return
+
+        self.current = get_current(self.token)
+        if isinstance(self.current, dict) and self.current.get("_error"):
+            self.current = None
+            self.entries = []
+            self.projects = {}
+            self._rate_limited = True
+            _cache["ts"] = now  # don't retry immediately
+            return
+
+        raw = get_recent(self.token)
+
+        self.projects = get_projects(self.token, self.wid)
+        if isinstance(self.projects, dict) and self.projects.get("_error"):
+            self.projects = {}
+            self._rate_limited = True
+            _cache["ts"] = now
+            return
+
+        self._rate_limited = False
+
+        # Deduplicate by description+project, keep most recent
+        seen = set()
+        deduped = []
+        for e in raw:
+            # Skip currently running entry from recent list
+            if self.current and e.get("id") == self.current.get("id"):
+                continue
+            key = (e.get("description", ""), e.get("project_id"))
+            if key not in seen:
+                seen.add(key)
+                deduped.append(e)
+            if len(deduped) >= 8:
+                break
+        self.entries = deduped
+
+        _cache["current"] = self.current
+        _cache["entries"] = self.entries
+        _cache["projects"] = self.projects
+        _cache["ts"] = now
+
+    def handle_search(self, _query):
+        if not self.configured():
+            send_clear()
+            self.results = [("setup", None)]
+            send_append(0, "Toggl Track: Setup required",
+                        "Click to enter your API token & workspace ID",
+                        ICON_SETTINGS)
+            send_finished()
+            return
+
+        self.refresh()
+        self.results = []
+        send_clear()
+
+        if self._rate_limited:
+            self.results = [("none", None)]
+            send_append(0, "API rate limit reached",
+                        "Free plan limit — try again in a few minutes",
+                        ICON_WARNING)
+            send_finished()
+            return
+
+        idx = 0
+
+        # Running timer — click to stop
+        if self.current:
+            desc = entry_description(self.current)
+            proj = project_name(self.current, self.projects)
+            elapsed = elapsed_str(self.current.get("start", ""))
+            detail = f"Elapsed: {elapsed}"
+            if proj:
+                detail = f"{proj} \u2022 {detail}"
+            send_append(idx, f"Running: {desc}",
+                        f"{detail} \u2022 Click to stop", ICON_STOP)
+            self.results.append(("stop", self.current))
+            idx += 1
+
+        # New timer
+        send_append(idx, "New timer",
+                    "Start a new timer with project selection", ICON_PLUS)
+        self.results.append(("new", None))
+        idx += 1
+
+        # Recent entries
+        for entry in self.entries:
+            desc = entry_description(entry)
+            proj = project_name(entry, self.projects)
+            detail = proj or "No project"
+            send_append(idx, desc, detail, ICON_PLAY)
+            self.results.append(("start", entry))
+            idx += 1
+
+        send_finished()
+
+    def handle_activate(self, id_):
+        if id_ >= len(self.results):
+            return
+        action, entry = self.results[id_]
+
+        if action == "stop":
+            self.stop_current()
+            _cache["ts"] = 0
+            desc = entry_description(entry)
+            send_fill(f"Stopped: {desc}")
+            send_close()
+
+        elif action == "new":
+            self.refresh()
+            self.stop_current()
+            result = run_new_timer(self.projects)
+            if result:
+                desc, pid = result
+                start_timer(self.token, self.wid, desc, pid)
+                _cache["ts"] = 0
+                send_fill(f"Started: {desc}")
+                send_close()
+            else:
+                _cache["ts"] = 0
+                send_close()
+
+        elif action == "start":
+            self.stop_current()
+            desc = entry_description(entry)
+            pid = entry.get("project_id")
+            tags = entry.get("tags")
+            start_timer(self.token, self.wid, desc, pid, tags)
+            _cache["ts"] = 0
+            send_fill(f"Started: {desc}")
+            send_close()
+
+        elif action == "setup":
+            result = run_setup()
+            if result:
+                self.token, self.wid = result
+                send_fill("tog ")
+            else:
+                send_close()
+
+        elif action == "none":
+            pass
+
+    def handle_context(self, id_):
+        options = [
+            {"name": "Open Toggl in browser", "description": "Open track.toggl.com"},
+        ]
+        if self.current:
+            desc = entry_description(self.current)
+            options.append({"name": "Stop timer", "description": f"Stop: {desc}"})
+        send_context(id_, options)
+
+    def handle_activate_context(self, id_, context):
+        if context == 0:
+            # Open Toggl in browser
+            try:
+                subprocess.Popen(
+                    ["xdg-open", TOGGL_URL],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception as e:
+                log(f"xdg-open failed: {e}")
+            send_close()
+
+        elif context == 1 and self.current:
+            desc = entry_description(self.current)
+            self.stop_current()
+            _cache["ts"] = 0
+            send_fill(f"Stopped: {desc}")
+            send_close()
+
+
+def main():
+    plugin = Plugin()
+
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            log(f"Bad JSON: {line}")
+            continue
+
+        if "Search" in msg:
+            plugin.handle_search(msg["Search"])
+        elif "Activate" in msg:
+            val = msg["Activate"]
+            if isinstance(val, int):
+                plugin.handle_activate(val)
+        elif "Context" in msg:
+            val = msg["Context"]
+            if isinstance(val, int):
+                plugin.handle_context(val)
+        elif "ActivateContext" in msg:
+            ac = msg["ActivateContext"]
+            if isinstance(ac, dict) and isinstance(ac.get("id"), int) and isinstance(ac.get("context"), int):
+                plugin.handle_activate_context(ac["id"], ac["context"])
+        elif "Interrupt" in msg:
+            pass  # nothing async to cancel
+        elif "Exit" in msg:
+            break
+
+
+if __name__ == "__main__":
+    main()
