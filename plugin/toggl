@@ -117,6 +117,23 @@ def run_new_timer(projects):
         return None
 
 
+def _fetch_workspaces(token):
+    """Fetch the user's workspaces using the provided API token."""
+    url = f"{API_BASE}/workspaces"
+    cred = b64encode(f"{token}:api_token".encode()).decode()
+    req = urllib.request.Request(url, method="GET")
+    req.add_header("Authorization", f"Basic {cred}")
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+            if isinstance(data, list):
+                return [(w["id"], w.get("name", f"Workspace {w['id']}")) for w in data]
+    except Exception as e:
+        log(f"Failed to fetch workspaces: {e}")
+    return None
+
+
 def run_setup():
     """Launch zenity dialogs to configure the plugin. Returns (token, wid) or None."""
     try:
@@ -131,23 +148,51 @@ def run_setup():
             return None
         token = token.stdout.strip()
 
-        wid = subprocess.run(
-            ["zenity", "--entry",
-             "--title=Toggl Track Setup",
-             "--text=Enter your Workspace ID\n(visible in the URL at track.toggl.com/reports):",
-             "--width=400"],
-            capture_output=True, text=True, timeout=60,
-        )
-        if wid.returncode != 0 or not wid.stdout.strip():
-            return None
-        try:
-            wid = int(wid.stdout.strip())
-        except ValueError:
-            subprocess.run(
-                ["zenity", "--error", "--text=Workspace ID must be a number.", "--width=300"],
-                timeout=10,
+        # Try to fetch workspaces automatically
+        workspaces = _fetch_workspaces(token)
+
+        if workspaces and len(workspaces) == 1:
+            # Only one workspace — use it directly
+            wid = workspaces[0][0]
+        elif workspaces and len(workspaces) > 1:
+            # Multiple workspaces — let user pick
+            items = []
+            for ws_id, ws_name in workspaces:
+                items.extend([str(ws_id), ws_name])
+            proj = subprocess.run(
+                ["zenity", "--list",
+                 "--title=Select Workspace",
+                 "--text=Choose your workspace:",
+                 "--column=ID", "--column=Workspace",
+                 "--hide-column=1",
+                 "--width=400", "--height=300"] + items,
+                capture_output=True, text=True, timeout=120,
             )
-            return None
+            if proj.returncode != 0 or not proj.stdout.strip():
+                return None
+            try:
+                wid = int(proj.stdout.strip())
+            except ValueError:
+                return None
+        else:
+            # API call failed — fall back to manual entry
+            wid_input = subprocess.run(
+                ["zenity", "--entry",
+                 "--title=Toggl Track Setup",
+                 "--text=Could not fetch workspaces automatically.\nEnter your Workspace ID manually\n(go to track.toggl.com, look for ?wid= or &wid= in the URL):",
+                 "--width=400"],
+                capture_output=True, text=True, timeout=60,
+            )
+            if wid_input.returncode != 0 or not wid_input.stdout.strip():
+                return None
+            try:
+                wid = int(wid_input.stdout.strip())
+            except ValueError:
+                subprocess.run(
+                    ["zenity", "--error", "--text=Workspace ID must be a number.", "--width=300"],
+                    timeout=10,
+                )
+                return None
 
         save_config(token, wid)
         return token, wid
@@ -203,13 +248,14 @@ def get_projects(token, wid):
     return {}
 
 
-def start_timer(token, wid, description, project_id=None, tags=None):
+def start_timer(token, wid, description, project_id=None, tags=None, billable=False):
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     body = {
         "description": description,
         "start": now,
         "duration": -1,
         "workspace_id": wid,
+        "billable": billable,
         "created_with": "pop-launcher-toggl",
     }
     if project_id:
@@ -345,7 +391,7 @@ class Plugin:
             if key not in seen:
                 seen.add(key)
                 deduped.append(e)
-            if len(deduped) >= 8:
+            if len(deduped) >= 20:
                 break
         self.entries = deduped
 
@@ -354,7 +400,23 @@ class Plugin:
         _cache["projects"] = self.projects
         _cache["ts"] = now
 
-    def handle_search(self, _query):
+    def _filter_text(self, query):
+        """Extract filter text from the search query (everything after the keyword)."""
+        # Strip the "toggl" prefix and any leading whitespace
+        rest = query[len("toggl"):] if query.lower().startswith("toggl") else query
+        return rest.strip().lower()
+
+    def _matches_filter(self, entry, filter_text):
+        """Check if an entry matches the filter by description or project name."""
+        desc = entry_description(entry).lower()
+        if filter_text in desc:
+            return True
+        proj = project_name(entry, self.projects)
+        if proj and filter_text in proj.lower():
+            return True
+        return False
+
+    def handle_search(self, query):
         if not self.configured():
             send_clear()
             self.results = [("setup", None)]
@@ -376,35 +438,45 @@ class Plugin:
             send_finished()
             return
 
+        filter_text = self._filter_text(query)
         idx = 0
 
-        # Running timer — click to stop
+        # Running timer — click to stop (show if no filter or if it matches)
         if self.current:
-            desc = entry_description(self.current)
-            proj = project_name(self.current, self.projects)
-            elapsed = elapsed_str(self.current.get("start", ""))
-            detail = f"Elapsed: {elapsed}"
-            if proj:
-                detail = f"{proj} \u2022 {detail}"
-            send_append(idx, f"Running: {desc}",
-                        f"{detail} \u2022 Click to stop", ICON_STOP)
-            self.results.append(("stop", self.current))
+            if not filter_text or self._matches_filter(self.current, filter_text):
+                desc = entry_description(self.current)
+                proj = project_name(self.current, self.projects)
+                elapsed = elapsed_str(self.current.get("start", ""))
+                detail = f"Elapsed: {elapsed}"
+                if proj:
+                    detail = f"{proj} \u2022 {detail}"
+                send_append(idx, f"Running: {desc}",
+                            f"{detail} \u2022 Click to stop", ICON_STOP)
+                self.results.append(("stop", self.current))
+                idx += 1
+
+        # New timer (only when not filtering)
+        if not filter_text:
+            send_append(idx, "New timer",
+                        "Start a new timer with project selection", ICON_PLUS)
+            self.results.append(("new", None))
             idx += 1
 
-        # New timer
-        send_append(idx, "New timer",
-                    "Start a new timer with project selection", ICON_PLUS)
-        self.results.append(("new", None))
-        idx += 1
-
-        # Recent entries
+        # Recent entries — filter locally and limit display
+        max_shown = 8 if filter_text else 5
+        shown = 0
         for entry in self.entries:
+            if filter_text and not self._matches_filter(entry, filter_text):
+                continue
             desc = entry_description(entry)
             proj = project_name(entry, self.projects)
             detail = proj or "No project"
             send_append(idx, desc, detail, ICON_PLAY)
             self.results.append(("start", entry))
             idx += 1
+            shown += 1
+            if shown >= max_shown:
+                break
 
         send_finished()
 
@@ -439,7 +511,8 @@ class Plugin:
             desc = entry_description(entry)
             pid = entry.get("project_id")
             tags = entry.get("tags")
-            start_timer(self.token, self.wid, desc, pid, tags)
+            billable = entry.get("billable", False)
+            start_timer(self.token, self.wid, desc, pid, tags, billable)
             _cache["ts"] = 0
             send_fill(f"Started: {desc}")
             send_close()
