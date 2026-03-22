@@ -41,8 +41,8 @@ def log(msg):
 def load_config():
     """Parse config.toml manually (no external deps)."""
     if not CONFIG_PATH.exists():
-        return None, None
-    token, wid = "", 0
+        return None, None, DEFAULT_KEYWORD
+    token, wid, keyword = "", 0, DEFAULT_KEYWORD
     for line in CONFIG_PATH.read_text().splitlines():
         line = line.strip()
         if line.startswith("#") or "=" not in line:
@@ -58,16 +58,19 @@ def load_config():
                 wid = int(val)
             except ValueError:
                 wid = 0
-    return token or None, wid or None
+        elif key == "keyword":
+            keyword = val or DEFAULT_KEYWORD
+    return token or None, wid or None, keyword
 
 
-def save_config(token, wid):
+def save_config(token, wid, keyword=DEFAULT_KEYWORD):
     """Write config.toml with restricted permissions."""
     CONFIG_PATH.write_text(
         '# Toggl Track API configuration\n'
         '# Get your API token from: https://track.toggl.com/profile\n\n'
         f'api_token = "{token}"\n'
         f'workspace_id = {wid}\n'
+        f'keyword = "{keyword}"\n'
     )
     CONFIG_PATH.chmod(0o600)
 
@@ -134,7 +137,7 @@ def _fetch_workspaces(token):
     return None
 
 
-def run_setup():
+def run_setup(keyword=DEFAULT_KEYWORD):
     """Launch zenity dialogs to configure the plugin. Returns (token, wid) or None."""
     try:
         token = subprocess.run(
@@ -194,7 +197,7 @@ def run_setup():
                 )
                 return None
 
-        save_config(token, wid)
+        save_config(token, wid, keyword)
         return token, wid
     except FileNotFoundError:
         log("zenity not found")
@@ -335,7 +338,7 @@ def send_context(id_, options):
 
 class Plugin:
     def __init__(self):
-        self.token, self.wid = load_config()
+        self.token, self.wid, self.keyword = load_config()
         self.current = None    # running timer entry
         self.entries = []      # recent entries (deduped)
         self.projects = {}     # id -> name
@@ -402,8 +405,9 @@ class Plugin:
 
     def _filter_text(self, query):
         """Extract filter text from the search query (everything after the keyword)."""
-        # Strip the "toggl" prefix and any leading whitespace
-        rest = query[len("toggl"):] if query.lower().startswith("toggl") else query
+        q = query.lower()
+        kw = self.keyword.lower()
+        rest = query[len(kw):] if q.startswith(kw) else query
         return rest.strip().lower()
 
     def _matches_filter(self, entry, filter_text):
@@ -518,10 +522,10 @@ class Plugin:
             send_close()
 
         elif action == "setup":
-            result = run_setup()
+            result = run_setup(self.keyword)
             if result:
                 self.token, self.wid = result
-                send_fill("tog ")
+                send_fill(f"{self.keyword} ")
             else:
                 send_close()
 
