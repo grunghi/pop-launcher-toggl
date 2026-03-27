@@ -76,19 +76,23 @@ def save_config(token, wid, keyword=DEFAULT_KEYWORD):
     CONFIG_PATH.chmod(0o600)
 
 
-def run_new_timer(projects):
-    """Launch zenity dialogs to create a new timer. Returns (description, project_id) or None."""
+def run_new_timer(projects, prefill_desc=None):
+    """Launch zenity dialogs to create a new timer. Returns (description, project_id) or None.
+    If prefill_desc is given, skip the description dialog and go straight to project selection."""
     try:
-        desc = subprocess.run(
-            ["zenity", "--entry",
-             "--title=New Toggl Timer",
-             "--text=Timer description:",
-             "--width=400"],
-            capture_output=True, text=True, timeout=120,
-        )
-        if desc.returncode != 0 or not desc.stdout.strip():
-            return None
-        description = desc.stdout.strip()
+        if prefill_desc:
+            description = prefill_desc
+        else:
+            desc = subprocess.run(
+                ["zenity", "--entry",
+                 "--title=New Toggl Timer",
+                 "--text=Timer description:",
+                 "--width=400"],
+                capture_output=True, text=True, timeout=120,
+            )
+            if desc.returncode != 0 or not desc.stdout.strip():
+                return None
+            description = desc.stdout.strip()
 
         project_id = None
         if projects:
@@ -383,6 +387,7 @@ class Plugin:
         self.projects = {}     # id -> name
         self.results = []      # id -> action mapping
         self._rate_limited = False
+        self._filter_text_value = ""
 
     def configured(self):
         return self.token and self.wid
@@ -483,6 +488,7 @@ class Plugin:
             return
 
         filter_text = self._filter_text(query)
+        self._filter_text_value = filter_text
         idx = 0
 
         # Running timer — click to stop (show if no filter or if it matches)
@@ -500,12 +506,15 @@ class Plugin:
                 self.results.append(("stop", self.current))
                 idx += 1
 
-        # New timer (only when not filtering)
-        if not filter_text:
+        # New timer — always shown; when filtering, uses typed text as description
+        if filter_text:
+            send_append(idx, f"New timer: {filter_text}",
+                        "Start timer with project selection", ICON_PLUS)
+        else:
             send_append(idx, "New timer",
                         "Start a new timer with project selection", ICON_PLUS)
-            self.results.append(("new", None))
-            idx += 1
+        self.results.append(("new", None))
+        idx += 1
 
         # Recent entries — fuzzy filter and sort by score
         max_shown = 8 if filter_text else 5
@@ -549,7 +558,8 @@ class Plugin:
         elif action == "new":
             self.refresh()
             self.stop_current()
-            result = run_new_timer(self.projects)
+            prefill = self._filter_text_value or None
+            result = run_new_timer(self.projects, prefill_desc=prefill)
             if result:
                 desc, pid = result
                 start_timer(self.token, self.wid, desc, pid)
