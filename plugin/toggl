@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 from base64 import b64encode
@@ -334,6 +335,44 @@ def send_context(id_, options):
     send({"Context": {"id": id_, "options": options}})
 
 
+# -- Fuzzy matching ------------------------------------------------------------
+
+def _strip_diacritics(text):
+    """Remove diacritics (e.g. á→a, ž→z) and lowercase."""
+    nfkd = unicodedata.normalize("NFKD", text)
+    return "".join(c for c in nfkd if not unicodedata.combining(c)).lower()
+
+
+def _fuzzy_score(query, text):
+    """Score how well *query* fuzzy-matches *text*. Returns int or None."""
+    query = _strip_diacritics(query)
+    text_norm = _strip_diacritics(text)
+    if not query:
+        return 0
+
+    qi = 0
+    score = 0
+    prev_match = -2
+
+    for ti, tc in enumerate(text_norm):
+        if qi < len(query) and tc == query[qi]:
+            if ti == prev_match + 1:
+                score += 3           # consecutive chars
+            elif ti == 0 or text_norm[ti - 1] in " _-./":
+                score += 2           # word boundary
+            else:
+                score += 1
+            prev_match = ti
+            qi += 1
+
+    if qi < len(query):
+        return None                  # not all query chars found
+
+    # Prefer tighter matches (shorter target text)
+    score += max(0, 10 - (len(text_norm) - len(query)))
+    return score
+
+
 # -- Plugin state --------------------------------------------------------------
 
 class Plugin:
@@ -408,17 +447,18 @@ class Plugin:
         q = query.lower()
         kw = self.keyword.lower()
         rest = query[len(kw):] if q.startswith(kw) else query
-        return rest.strip().lower()
+        return rest.strip()
 
-    def _matches_filter(self, entry, filter_text):
-        """Check if an entry matches the filter by description or project name."""
-        desc = entry_description(entry).lower()
-        if filter_text in desc:
-            return True
-        proj = project_name(entry, self.projects)
-        if proj and filter_text in proj.lower():
-            return True
-        return False
+    def _score_entry(self, entry, filter_text):
+        """Score an entry against the filter. Returns int score or None if no match."""
+        desc = entry_description(entry)
+        proj = project_name(entry, self.projects) or ""
+        best = None
+        for text in (desc, proj):
+            s = _fuzzy_score(filter_text, text)
+            if s is not None and (best is None or s > best):
+                best = s
+        return best
 
     def handle_search(self, query):
         if not self.configured():
@@ -447,7 +487,8 @@ class Plugin:
 
         # Running timer — click to stop (show if no filter or if it matches)
         if self.current:
-            if not filter_text or self._matches_filter(self.current, filter_text):
+            current_score = self._score_entry(self.current, filter_text) if filter_text else 0
+            if not filter_text or current_score is not None:
                 desc = entry_description(self.current)
                 proj = project_name(self.current, self.projects)
                 elapsed = elapsed_str(self.current.get("start", ""))
@@ -466,12 +507,21 @@ class Plugin:
             self.results.append(("new", None))
             idx += 1
 
-        # Recent entries — filter locally and limit display
+        # Recent entries — fuzzy filter and sort by score
         max_shown = 8 if filter_text else 5
+        if filter_text:
+            scored = []
+            for entry in self.entries:
+                s = self._score_entry(entry, filter_text)
+                if s is not None:
+                    scored.append((s, entry))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            ranked = [e for _, e in scored]
+        else:
+            ranked = self.entries
+
         shown = 0
-        for entry in self.entries:
-            if filter_text and not self._matches_filter(entry, filter_text):
-                continue
+        for entry in ranked:
             desc = entry_description(entry)
             proj = project_name(entry, self.projects)
             detail = proj or "No project"
