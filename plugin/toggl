@@ -76,55 +76,6 @@ def save_config(token, wid, keyword=DEFAULT_KEYWORD):
     CONFIG_PATH.chmod(0o600)
 
 
-def run_new_timer(projects, prefill_desc=None):
-    """Launch zenity dialogs to create a new timer. Returns (description, project_id) or None.
-    If prefill_desc is given, skip the description dialog and go straight to project selection."""
-    try:
-        if prefill_desc:
-            description = prefill_desc
-        else:
-            desc = subprocess.run(
-                ["zenity", "--entry",
-                 "--title=New Toggl Timer",
-                 "--text=Timer description:",
-                 "--width=400"],
-                capture_output=True, text=True, timeout=120,
-            )
-            if desc.returncode != 0 or not desc.stdout.strip():
-                return None
-            description = desc.stdout.strip()
-
-        project_id = None
-        if projects:
-            # Build column data: ID, Name pairs
-            items = []
-            for pid, pname in sorted(projects.items(), key=lambda x: x[1].lower()):
-                items.extend([str(pid), pname])
-
-            proj = subprocess.run(
-                ["zenity", "--list",
-                 "--title=Select Project",
-                 "--text=Choose a project (or cancel for no project):",
-                 "--column=ID", "--column=Project",
-                 "--hide-column=1",
-                 "--width=400", "--height=400"] + items,
-                capture_output=True, text=True, timeout=120,
-            )
-            if proj.returncode == 0 and proj.stdout.strip():
-                try:
-                    project_id = int(proj.stdout.strip())
-                except ValueError:
-                    pass
-
-        return description, project_id
-    except FileNotFoundError:
-        log("zenity not found")
-        return None
-    except Exception as e:
-        log(f"New timer dialog error: {e}")
-        return None
-
-
 def _fetch_workspaces(token):
     """Fetch the user's workspaces using the provided API token."""
     url = f"{API_BASE}/workspaces"
@@ -388,6 +339,7 @@ class Plugin:
         self.results = []      # id -> action mapping
         self._rate_limited = False
         self._filter_text_value = ""
+        self._pending_new_desc = None  # set when picking a project inline
 
     def configured(self):
         return self.token and self.wid
@@ -465,6 +417,45 @@ class Plugin:
                 best = s
         return best
 
+    def _show_project_selection(self, filter_text):
+        """Show project list in the launcher for the pending new timer."""
+        self.results = []
+        send_clear()
+        idx = 0
+
+        # Header — clicking cancels
+        title = f"Creating: {self._pending_new_desc}" if self._pending_new_desc else "New timer (no description)"
+        send_append(idx, title,
+                    "Select a project below (click here to cancel)", ICON_PLUS)
+        self.results.append(("cancel_new", None))
+        idx += 1
+
+        # No project option
+        send_append(idx, "No project",
+                    "Start timer without a project", ICON_PLAY)
+        self.results.append(("select_project", None))
+        idx += 1
+
+        # Project list — fuzzy-filtered and sorted by score if typing
+        if self.projects:
+            if filter_text:
+                scored = []
+                for pid, pname in self.projects.items():
+                    s = _fuzzy_score(filter_text, pname)
+                    if s is not None:
+                        scored.append((s, pid, pname))
+                scored.sort(key=lambda x: x[0], reverse=True)
+                project_list = [(pid, pname) for _, pid, pname in scored]
+            else:
+                project_list = sorted(self.projects.items(), key=lambda x: x[1].lower())
+
+            for pid, pname in project_list:
+                send_append(idx, pname, "Select project", ICON_PLAY)
+                self.results.append(("select_project", pid))
+                idx += 1
+
+        send_finished()
+
     def handle_search(self, query):
         if not self.configured():
             send_clear()
@@ -489,6 +480,12 @@ class Plugin:
 
         filter_text = self._filter_text(query)
         self._filter_text_value = filter_text
+
+        # Project selection mode for pending new timer
+        if self._pending_new_desc is not None:
+            self._show_project_selection(filter_text)
+            return
+
         idx = 0
 
         # Running timer — click to stop (show if no filter or if it matches)
@@ -557,18 +554,22 @@ class Plugin:
 
         elif action == "new":
             self.refresh()
+            self._pending_new_desc = self._filter_text_value or ""
+            send_fill(f"{self.keyword} ")
+
+        elif action == "select_project":
             self.stop_current()
-            prefill = self._filter_text_value or None
-            result = run_new_timer(self.projects, prefill_desc=prefill)
-            if result:
-                desc, pid = result
-                start_timer(self.token, self.wid, desc, pid)
-                _cache["ts"] = 0
-                send_fill(f"Started: {desc}")
-                send_close()
-            else:
-                _cache["ts"] = 0
-                send_close()
+            desc = self._pending_new_desc
+            pid = entry  # project_id or None
+            self._pending_new_desc = None
+            start_timer(self.token, self.wid, desc, pid)
+            _cache["ts"] = 0
+            send_fill(f"Started: {desc}")
+            send_close()
+
+        elif action == "cancel_new":
+            self._pending_new_desc = None
+            send_fill(f"{self.keyword} ")
 
         elif action == "start":
             self.stop_current()
