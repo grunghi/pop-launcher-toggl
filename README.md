@@ -42,6 +42,14 @@ Type your keyword (default `toggl`) to see your running timer and recent entries
 
 Right-click any entry for extra options (open Toggl in browser, stop timer).
 
+## Update
+
+```bash
+curl -sSL https://raw.githubusercontent.com/grunghi/pop-launcher-toggl/main/update.sh | bash
+```
+
+Your configuration (API token, workspace, keyword) is preserved.
+
 ## Uninstall
 
 ```bash
