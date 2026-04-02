@@ -33,6 +33,7 @@ ICON_SETTINGS = str(ICON_DIR / "settings.svg")
 # Cache
 _cache = {"entries": None, "current": None, "projects": None, "ts": 0}
 _cache_lock = threading.Lock()
+_cache_ready = threading.Event()  # set after the first successful refresh
 CACHE_TTL = 120
 STALE_MAX = 600
 DEFAULT_KEYWORD = "toggl"
@@ -439,6 +440,7 @@ class Plugin:
             log(f"Background refresh error: {e}")
         finally:
             self._bg_refreshing = False
+            _cache_ready.set()
 
     def refresh(self, force=False):
         now = time.monotonic()
@@ -449,8 +451,14 @@ class Plugin:
             self._load_from_cache()
             return
 
-        # Stale or empty — use whatever we have, refresh in background
-        # Never block the main loop; startup pre-warming handles cold start
+        if not _cache["ts"]:
+            # Cold start — wait briefly for the pre-warm to deliver data
+            self._start_bg_refresh()
+            _cache_ready.wait(timeout=2)
+            self._load_from_cache()
+            return
+
+        # Stale — use what we have, refresh in background
         self._load_from_cache()
         self._start_bg_refresh()
 
