@@ -3,6 +3,7 @@
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -38,7 +39,10 @@ DEFAULT_KEYWORD = "toggl"
 
 
 def log(msg):
-    print(msg, file=sys.stderr, flush=True)
+    try:
+        print(msg, file=sys.stderr, flush=True)
+    except BrokenPipeError:
+        pass
 
 
 # -- Config ------------------------------------------------------------------
@@ -445,14 +449,10 @@ class Plugin:
             self._load_from_cache()
             return
 
-        if _cache["ts"] and cache_age < STALE_MAX:
-            # Stale but usable — show stale data, refresh in background
-            self._load_from_cache()
-            self._start_bg_refresh()
-            return
-
-        # No cache or too old — blocking parallel fetch
-        self._do_refresh()
+        # Stale or empty — use whatever we have, refresh in background
+        # Never block the main loop; startup pre-warming handles cold start
+        self._load_from_cache()
+        self._start_bg_refresh()
 
     def _filter_text(self, query):
         """Extract filter text from the search query (everything after the keyword)."""
@@ -595,47 +595,54 @@ class Plugin:
 
         send_finished()
 
+    def _fire_and_forget(self, fn, *args):
+        """Run fn(*args) in a daemon thread — never blocks the main loop."""
+        threading.Thread(target=fn, args=args, daemon=True).start()
+
     def handle_activate(self, id_):
         if id_ >= len(self.results):
             return
         action, entry = self.results[id_]
 
         if action == "stop":
-            self.stop_current()
-            _cache["ts"] = 0
             desc = entry_description(entry)
+            _cache["ts"] = 0
             send_fill(f"Stopped: {desc}")
             send_close()
+            self._fire_and_forget(self.stop_current)
 
         elif action == "new":
-            self.refresh()
             self._pending_new_desc = self._filter_text_value or ""
             send_fill(f"{self.keyword} ")
 
         elif action == "select_project":
-            self.stop_current()
             desc = self._pending_new_desc
             pid = entry  # project_id or None
             self._pending_new_desc = None
-            start_timer(self.token, self.wid, desc, pid)
             _cache["ts"] = 0
             send_fill(f"Started: {desc}")
             send_close()
+            def _start_new():
+                self.stop_current()
+                start_timer(self.token, self.wid, desc, pid)
+            self._fire_and_forget(_start_new)
 
         elif action == "cancel_new":
             self._pending_new_desc = None
             send_fill(f"{self.keyword} ")
 
         elif action == "start":
-            self.stop_current()
             desc = entry_description(entry)
             pid = entry.get("project_id")
             tags = entry.get("tags")
             billable = entry.get("billable", False)
-            start_timer(self.token, self.wid, desc, pid, tags, billable)
             _cache["ts"] = 0
             send_fill(f"Started: {desc}")
             send_close()
+            def _restart():
+                self.stop_current()
+                start_timer(self.token, self.wid, desc, pid, tags, billable)
+            self._fire_and_forget(_restart)
 
         elif action == "setup":
             result = run_setup(self.keyword)
@@ -672,13 +679,18 @@ class Plugin:
 
         elif context == 1 and self.current:
             desc = entry_description(self.current)
-            self.stop_current()
             _cache["ts"] = 0
             send_fill(f"Stopped: {desc}")
             send_close()
+            self._fire_and_forget(self.stop_current)
 
 
 def main():
+    # Let the OS handle SIGPIPE (immediate exit) instead of Python raising
+    # BrokenPipeError — prevents unhandled exceptions when pop-launcher
+    # closes our stdout/stderr pipes.
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+
     plugin = Plugin()
 
     try:
