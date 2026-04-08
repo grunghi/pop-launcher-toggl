@@ -604,8 +604,12 @@ class Plugin:
         send_finished()
 
     def _fire_and_forget(self, fn, *args):
-        """Run fn(*args) in a daemon thread — never blocks the main loop."""
-        threading.Thread(target=fn, args=args, daemon=True).start()
+        """Run fn(*args) in a background thread — never blocks the main loop.
+
+        Non-daemon so Python waits for the API call to finish before exiting
+        when pop-launcher closes stdin after our Close message. Otherwise the
+        thread gets killed mid-request and the timer never actually starts."""
+        threading.Thread(target=fn, args=args, daemon=False).start()
 
     def handle_activate(self, id_):
         if id_ >= len(self.results):
