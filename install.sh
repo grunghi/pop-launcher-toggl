@@ -6,6 +6,20 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 echo "Installing Toggl Track pop-launcher plugin..."
 
+# -- Require the Rust toolchain ----------------------------------------------
+
+if ! command -v cargo &>/dev/null; then
+    echo "Error: 'cargo' not found. The plugin is built from Rust source." >&2
+    echo "Install the Rust toolchain from https://rustup.rs and re-run." >&2
+    exit 1
+fi
+
+# -- Build the binary --------------------------------------------------------
+
+echo "Building (cargo build --release)..."
+( cd "$SCRIPT_DIR" && cargo build --release )
+BINARY="$SCRIPT_DIR/target/release/toggl"
+
 # -- Interactive setup via zenity (if available) -----------------------------
 
 KEYWORD="toggl"
@@ -33,43 +47,24 @@ if command -v zenity &>/dev/null; then
     API_TOKEN=$(echo "$API_TOKEN" | tr -cd 'a-zA-Z0-9')
 
     if [ -n "$API_TOKEN" ]; then
-        # Try to fetch workspaces from API
+        # Try to fetch workspaces from the API (parsed without external deps)
         WS_JSON=$(curl -sSf -u "${API_TOKEN}:api_token" \
             -H "Content-Type: application/json" \
             "https://api.track.toggl.com/api/v9/workspaces" 2>/dev/null) || WS_JSON=""
 
-        WS_COUNT=0
-        if [ -n "$WS_JSON" ] && command -v python3 &>/dev/null; then
-            WS_COUNT=$(python3 -c "import json,sys; data=json.loads(sys.stdin.read()); print(len(data))" <<< "$WS_JSON" 2>/dev/null) || WS_COUNT=0
-        fi
+        # Count workspaces by the number of top-level "id": fields
+        WS_IDS=$(echo "$WS_JSON" | grep -oE '"id":[[:space:]]*[0-9]+' | grep -oE '[0-9]+')
+        WS_COUNT=$(echo "$WS_IDS" | grep -c '[0-9]' || true)
 
-        if [ "$WS_COUNT" -eq 1 ] 2>/dev/null; then
+        if [ "$WS_COUNT" -eq 1 ]; then
             # Single workspace — use it directly
-            WORKSPACE_ID=$(python3 -c "import json,sys; data=json.loads(sys.stdin.read()); print(data[0]['id'])" <<< "$WS_JSON")
-            WS_NAME=$(python3 -c "import json,sys; data=json.loads(sys.stdin.read()); print(data[0].get('name',''))" <<< "$WS_JSON")
-            echo "Using workspace: $WS_NAME ($WORKSPACE_ID)"
-        elif [ "$WS_COUNT" -gt 1 ] 2>/dev/null; then
-            # Multiple workspaces — let user pick
-            ZENITY_ITEMS=$(python3 -c "
-import json, sys
-data = json.loads(sys.stdin.read())
-for w in data:
-    print(w['id'])
-    print(w.get('name', 'Workspace ' + str(w['id'])))
-" <<< "$WS_JSON")
-            WORKSPACE_ID=$(zenity --list \
-                --title="Select Workspace" \
-                --text="Choose your workspace:" \
-                --column=ID --column=Workspace \
-                --hide-column=1 \
-                --width=400 --height=300 \
-                $ZENITY_ITEMS 2>/dev/null) || WORKSPACE_ID=""
-            WORKSPACE_ID=$(echo "$WORKSPACE_ID" | tr -cd '0-9')
+            WORKSPACE_ID=$(echo "$WS_IDS" | head -1)
+            echo "Using workspace $WORKSPACE_ID"
         else
-            # API call failed — fall back to manual entry
+            # Zero, many, or unparseable — ask for the ID directly
             WORKSPACE_ID=$(zenity --entry \
                 --title="Toggl Track Setup" \
-                --text="Could not fetch workspaces automatically.\nEnter your Workspace ID manually\n(go to track.toggl.com, look for ?wid= or &wid= in the URL):" \
+                --text="Enter your Workspace ID\n(go to track.toggl.com, look for ?wid= or &wid= in the URL):" \
                 --width=400 2>/dev/null) || WORKSPACE_ID=""
             WORKSPACE_ID=$(echo "$WORKSPACE_ID" | tr -cd '0-9')
         fi
@@ -81,7 +76,7 @@ fi
 # -- Install files -----------------------------------------------------------
 
 mkdir -p "$PLUGIN_DIR/icons"
-cp "$SCRIPT_DIR/plugin/toggl" "$PLUGIN_DIR/toggl"
+cp "$BINARY" "$PLUGIN_DIR/toggl"
 chmod +x "$PLUGIN_DIR/toggl"
 cp "$SCRIPT_DIR/plugin/icons/"*.svg "$PLUGIN_DIR/icons/"
 
@@ -113,17 +108,6 @@ if [ ! -f "$PLUGIN_DIR/config.toml" ] || [ -n "$API_TOKEN" ]; then
 
 api_token = "${API_TOKEN}"
 workspace_id = ${WORKSPACE_ID:-0}
-keyword = "${KEYWORD}"
-EOF
-    chmod 600 "$PLUGIN_DIR/config.toml"
-elif [ ! -s "$PLUGIN_DIR/config.toml" ]; then
-    cat > "$PLUGIN_DIR/config.toml" <<EOF
-# Toggl Track API configuration
-# Get your API token from: https://track.toggl.com/profile
-# Find your workspace ID: go to track.toggl.com, look for ?wid= or &wid= in the URL
-
-api_token = ""
-workspace_id = 0
 keyword = "${KEYWORD}"
 EOF
     chmod 600 "$PLUGIN_DIR/config.toml"

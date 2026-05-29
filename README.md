@@ -58,7 +58,8 @@ rm -rf ~/.local/share/pop-launcher/plugins/toggl && pkill pop-launcher
 
 ## Requirements
 
-- Python 3.6+
+- Rust toolchain ([rustup](https://rustup.rs)) — the plugin is built from source on install
+- `git` (for the remote install/update one-liners)
 - pop-launcher (comes with Pop!_OS / COSMIC)
 - zenity (optional, for setup dialogs)
 

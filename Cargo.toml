@@ -1,0 +1,25 @@
+[package]
+name = "pop-launcher-toggl"
+version = "0.1.0"
+edition = "2021"
+description = "Control Toggl Track timers from the COSMIC / Pop!_OS launcher"
+license = "MIT"
+
+[[bin]]
+name = "toggl"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2", features = ["json"] }
+base64 = "0.22"
+unicode-normalization = "0.1"
+unicode-general-category = "1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
