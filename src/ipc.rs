@@ -50,11 +50,14 @@ pub fn close() {
     send(json!({ "Close": Value::Null }));
 }
 
-/// A right-click context menu option (name + description, as the Python sent).
-pub fn context(id: usize, options: Vec<(&str, String)>) {
+/// A right-click context menu. pop-launcher's `ContextOption` is `{ id, name }`;
+/// the option's `id` is what comes back in the `ActivateContext.context` field,
+/// so we assign ids by position.
+pub fn context(id: usize, options: Vec<String>) {
     let options: Vec<Value> = options
         .into_iter()
-        .map(|(name, description)| json!({ "name": name, "description": description }))
+        .enumerate()
+        .map(|(i, name)| json!({ "id": i, "name": name }))
         .collect();
     send(json!({ "Context": { "id": id, "options": options } }));
 }

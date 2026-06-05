@@ -2,7 +2,9 @@
 
 use std::collections::HashMap;
 use std::process::Command;
-use std::thread::{self, JoinHandle};
+use std::sync::{Condvar, Mutex, OnceLock};
+use std::thread;
+use std::time::Duration;
 
 use crate::api::{self, TimeEntry, TOGGL_URL};
 use crate::cache;
@@ -41,7 +43,12 @@ pub struct Plugin {
     results: Vec<Action>,
     filter_text_value: String,
     pending_new_desc: Option<String>,
-    actions: Vec<JoinHandle<()>>,
+}
+
+/// Count of in-flight fire-and-forget action threads (start/stop API calls).
+fn outstanding() -> &'static (Mutex<usize>, Condvar) {
+    static O: OnceLock<(Mutex<usize>, Condvar)> = OnceLock::new();
+    O.get_or_init(|| (Mutex::new(0), Condvar::new()))
 }
 
 impl Plugin {
@@ -57,7 +64,6 @@ impl Plugin {
             results: Vec::new(),
             filter_text_value: String::new(),
             pending_new_desc: None,
-            actions: Vec::new(),
         };
         // Pre-warm the cache so data is ready before the user types.
         if let (Some(token), Some(wid)) = (plugin.token.clone(), plugin.wid) {
@@ -70,16 +76,25 @@ impl Plugin {
         self.token.is_some() && self.wid.is_some()
     }
 
-    /// Wait for the activate threads we spawned so timer actions complete before
-    /// the process exits (the Python plugin relied on non-daemon threads here).
+    /// At shutdown, wait for in-flight start/stop calls to finish so timer
+    /// actions complete — but never block exit longer than this cap. Each call
+    /// already carries a 5s network timeout, so a hung network can't stall us
+    /// indefinitely (and thus can't keep our stdio pipe to pop-launcher open).
     pub fn join_actions(&mut self) {
-        for h in self.actions.drain(..) {
-            let _ = h.join();
-        }
+        let (lock, cv) = outstanding();
+        let guard = lock.lock().unwrap();
+        let _ = cv.wait_timeout_while(guard, Duration::from_secs(6), |n| *n > 0);
     }
 
     fn fire<F: FnOnce() + Send + 'static>(&mut self, f: F) {
-        self.actions.push(thread::spawn(f));
+        let (lock, _) = outstanding();
+        *lock.lock().unwrap() += 1;
+        thread::spawn(move || {
+            f();
+            let (lock, cv) = outstanding();
+            *lock.lock().unwrap() -= 1;
+            cv.notify_all();
+        });
     }
 
     fn load_from_cache(&mut self) {
@@ -363,10 +378,10 @@ impl Plugin {
     // -- Context menu ---------------------------------------------------------
 
     pub fn handle_context(&mut self, id: usize) {
-        let mut options: Vec<(&str, String)> =
-            vec![("Open Toggl in browser", "Open track.toggl.com".to_string())];
+        // Option order must match handle_activate_context: 0 = open browser, 1 = stop.
+        let mut options: Vec<String> = vec!["Open Toggl in browser".to_string()];
         if let Some(current) = &self.current {
-            options.push(("Stop timer", format!("Stop: {}", current.description_or_default())));
+            options.push(format!("Stop timer: {}", current.description_or_default()));
         }
         ipc::context(id, options);
     }
