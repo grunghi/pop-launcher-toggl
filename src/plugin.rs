@@ -83,7 +83,17 @@ impl Plugin {
     pub fn join_actions(&mut self) {
         let (lock, cv) = outstanding();
         let guard = lock.lock().unwrap();
-        let _ = cv.wait_timeout_while(guard, Duration::from_secs(6), |n| *n > 0);
+        if *guard == 0 {
+            return;
+        }
+        log(&format!("join_actions: waiting on {} in-flight action(s)", *guard));
+        // Hitting the cap means an API call outlived its own 5s timeout — we abandon
+        // it rather than hold our stdio pipe to pop-launcher open any longer.
+        if let Ok((n, res)) = cv.wait_timeout_while(guard, Duration::from_secs(6), |n| *n > 0) {
+            if res.timed_out() {
+                log(&format!("join_actions: timed out with {} still in flight", *n));
+            }
+        }
     }
 
     fn fire<F: FnOnce() + Send + 'static>(&mut self, f: F) {
@@ -304,8 +314,12 @@ impl Plugin {
         let wid = self.wid;
 
         match action {
+            // Never `fill` before `close`: the launcher treats filled text as a new
+            // query and broadcasts a search to every plugin, which `close` then tears
+            // down mid-flight. pop-launcher is left "backing off from search until
+            // plugins are ready" forever -- the wedge. The text was never visible
+            // anyway, since we close in the same breath.
             Action::Stop(entry) => {
-                ipc::fill(&format!("Stopped: {}", entry.description_or_default()));
                 ipc::close();
                 cache::invalidate();
                 if let (Some(token), Some(wid)) = (token, wid) {
@@ -320,7 +334,6 @@ impl Plugin {
 
             Action::SelectProject(pid) => {
                 let desc = self.pending_new_desc.take().unwrap_or_default();
-                ipc::fill(&format!("Started: {desc}"));
                 ipc::close();
                 cache::invalidate();
                 let current = self.current.clone();
@@ -341,7 +354,6 @@ impl Plugin {
 
             Action::Start(entry) => {
                 let desc = entry.description_or_default().to_string();
-                ipc::fill(&format!("Started: {desc}"));
                 ipc::close();
                 cache::invalidate();
                 let current = self.current.clone();
@@ -401,7 +413,7 @@ impl Plugin {
             }
             1 => {
                 if let Some(current) = self.current.clone() {
-                    ipc::fill(&format!("Stopped: {}", current.description_or_default()));
+                    // As in handle_activate: no `fill` before `close`.
                     ipc::close();
                     cache::invalidate();
                     if let (Some(token), Some(wid)) = (self.token.clone(), self.wid) {
