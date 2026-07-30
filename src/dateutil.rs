@@ -1,13 +1,43 @@
 //! Timestamp helpers, backed by the `time` crate.
 
+use std::sync::OnceLock;
+
 use time::format_description::well_known::Rfc3339;
 use time::macros::format_description;
-use time::OffsetDateTime;
+use time::{OffsetDateTime, UtcOffset};
+
+static LOG_OFFSET: OnceLock<UtcOffset> = OnceLock::new();
+
+/// Capture the machine's UTC offset while the process is still single-threaded.
+///
+/// `time` refuses to determine the local offset once other threads exist (it would be
+/// unsound), so this must be called first thing in `main`, before any thread is spawned.
+/// Falls back to UTC if the offset can't be determined — the formatted timestamp always
+/// carries its offset, so it stays unambiguous either way.
+pub fn init_log_offset() {
+    let _ = LOG_OFFSET.set(UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC));
+}
 
 /// Current UTC time as `YYYY-MM-DDTHH:MM:SSZ` (Toggl `start` format).
 pub fn now_rfc3339() -> String {
     let fmt = format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]Z");
     OffsetDateTime::now_utc().format(&fmt).unwrap_or_default()
+}
+
+/// Current time as `YYYY-MM-DD HH:MM:SS.mmm+HH:MM`, for log line prefixes.
+///
+/// Rendered in the offset captured by [`init_log_offset`] so log lines line up with
+/// `journalctl` without mental arithmetic; the trailing offset keeps it unambiguous.
+pub fn log_timestamp() -> String {
+    let fmt = format_description!(
+        "[year]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:3]\
+         [offset_hour sign:mandatory]:[offset_minute]"
+    );
+    let offset = LOG_OFFSET.get().copied().unwrap_or(UtcOffset::UTC);
+    OffsetDateTime::now_utc()
+        .to_offset(offset)
+        .format(&fmt)
+        .unwrap_or_default()
 }
 
 /// Human-readable elapsed time since `start_iso` (e.g. `1h 05m`, `42m`, `?`).

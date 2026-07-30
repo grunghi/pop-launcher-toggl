@@ -11,6 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::api::{self, ApiError, TimeEntry};
+use crate::log;
 
 pub const CACHE_TTL: Duration = Duration::from_secs(120);
 
@@ -58,6 +59,8 @@ pub fn snapshot() -> (Option<TimeEntry>, Vec<TimeEntry>, HashMap<i64, String>) {
 
 /// Fetch everything from the API (in parallel) and update the cache.
 fn do_refresh(token: &str, wid: i64) {
+    let started = Instant::now();
+    log("refresh: fetching current/recent/projects");
     let (cur, recent, projects) = {
         let t1 = token.to_string();
         let t2 = token.to_string();
@@ -75,21 +78,35 @@ fn do_refresh(token: &str, wid: i64) {
     // A rate-limited current timer aborts the refresh (matches Python).
     let current = match cur {
         Err(ApiError::RateLimit) => {
+            log(&format!(
+                "refresh: rate limited on current after {}ms",
+                started.elapsed().as_millis()
+            ));
             RATE_LIMITED.store(true, Ordering::SeqCst);
             cache().lock().unwrap().ts = Some(Instant::now());
             return;
         }
-        Err(ApiError::Other) => None,
+        Err(ApiError::Other) => {
+            log("refresh: current failed");
+            None
+        }
         Ok(c) => c,
     };
 
     let projects = match projects {
         Err(ApiError::RateLimit) => {
+            log(&format!(
+                "refresh: rate limited on projects after {}ms",
+                started.elapsed().as_millis()
+            ));
             RATE_LIMITED.store(true, Ordering::SeqCst);
             cache().lock().unwrap().ts = Some(Instant::now());
             return;
         }
-        Err(ApiError::Other) => HashMap::new(),
+        Err(ApiError::Other) => {
+            log("refresh: projects failed");
+            HashMap::new()
+        }
         Ok(p) => p,
     };
 
@@ -111,6 +128,14 @@ fn do_refresh(token: &str, wid: i64) {
             break;
         }
     }
+
+    log(&format!(
+        "refresh: done in {}ms (running={}, entries={}, projects={})",
+        started.elapsed().as_millis(),
+        current.is_some(),
+        deduped.len(),
+        projects.len()
+    ));
 
     let mut c = cache().lock().unwrap();
     c.current = current;
@@ -140,7 +165,12 @@ pub fn wait_ready(timeout: Duration) {
     if *guard {
         return;
     }
-    let _ = cv.wait_timeout_while(guard, timeout, |ready| !*ready);
+    // Hitting the cap means we stalled the launcher for the full timeout.
+    if let Ok((_, res)) = cv.wait_timeout_while(guard, timeout, |ready| !*ready) {
+        if res.timed_out() {
+            log(&format!("wait_ready: timed out after {}ms", timeout.as_millis()));
+        }
+    }
 }
 
 /// Refresh strategy: fresh→use cache, cold→wait briefly, stale→serve + refresh.
